@@ -1,0 +1,167 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Think about:
+Lasso and Ridge regression
+Principal Components and Partial Least Squares regression
+Regression and Classification trees (CART)
+Random Forests
+Support Vector Machines
+
+
+
+Loading pachages
+```{r}
+library(tidyverse) 
+library(tidytext)
+library(glmnet)
+
+```
+
+```{r}
+amazon = read_csv("./amazon_baby.csv") %>%
+  rownames_to_column('id')
+
+```
+
+```{r}
+trainidx = !is.na(amazon$rating)
+table(trainidx)
+
+```
+
+```{r}
+reviews = amazon %>% 
+  unnest_tokens(token, review) %>%
+  count(id, name, rating, token)
+
+bigrams = amazon %>% 
+  unnest_tokens(bigram, review, token = "ngrams", n = 2) %>%
+  count(id, name, rating, bigram)
+
+sw = reviews %>% 
+  inner_join(get_stopwords(), by = c(token='word')) %>% 
+  group_by(id) %>% 
+  mutate(N = sum(n))
+
+```
+
+```{r}
+features = 
+  reviews %>%
+  group_by(id) %>%
+  mutate(nwords = sum(n)) %>% # the number of tokens per document
+  group_by(token) %>%
+  mutate(
+      docfreq = n(), # number of documents that contain the token
+      idf = log(nrow(amazon) / docfreq), # inverse document frequency ('surprise')
+      tf = n / nwords,  # relative frequency of token within the given document
+      tf_idf = tf*idf
+  ) %>%
+  ungroup()
+```
+
+```{r}
+dtm <- 
+  filter(features, docfreq > 18) %>% 
+  cast_sparse(row=id, column=token, value = tf) 
+
+dim(dtm)
+
+
+used_rows = as.integer(rownames(dtm))
+used_amazon = amazon[used_rows, ]
+trainidx = trainidx[used_rows]
+table(trainidx)
+
+```
+
+```{r}
+y = used_amazon$rating
+fit_lasso_lm = glmnet(dtm[trainidx, ], y[trainidx])
+
+plot(fit_lasso_lm, xvar = 'lambda')
+
+pred_df = data.frame(id = which(trainidx), rating = y[trainidx]) %>%
+  mutate(pred = predict(fit_lasso_lm, dtm[trainidx, ], s = 10^-4)) # add predictions
+
+pred_df %>%
+  ggplot(aes(rating, pred)) + geom_point(position = "jitter", alpha = 0.2) +
+  geom_smooth(method = "lm", col = "red")
+
+
+
+
+```
+
+
+
+```{r}
+# Submission:
+
+sample_submission = read_csv("./amazon_baby_testset_sample.csv", col_types = cols(col_character(), col_double()))
+
+# used_rows computed earlier contains all the indices of reviews used in dtm
+all_test_reviews = which(is.na(amazon$rating))
+missing_test_ids = setdiff(used_rows, all_test_reviews)
+
+best_default_prediction = mean(y[trainidx]) # best prediction if now review features are available
+cat("best baseline prediction:", best_default_prediction,"\n")
+
+dtm_test_predictions = 
+  data.frame(Id = as.character(used_rows[!trainidx]), 
+             pred=predict(fit_lasso_lm, dtm[!trainidx, ], s = 10^-4)[,1]
+            )
+
+
+pred_df = sample_submission %>%
+  left_join(dtm_test_predictions) %>%
+  mutate(Prediction = ifelse(Id %in% missing_test_ids, best_default_prediction, pred)) # add predictions
+
+#nrow(pred_df)
+head(pred_df)
+
+pred_df %>% 
+  transmute(Id=Id, Prediction = Prediction) %>% 
+  write_csv("my_submission.csv")
+file.show("my_submission.csv")
+  
+```
+
+```{r}
+#Area under the curve calculation:
+
+pred = predict(fit_lasso_lm, dtm[trainidx,], s = 10^-4)
+tmp <- data.frame(pred = pred, truth = y[trainidx] > 3) 
+threshold = 4
+#with(tmp, table(pred = pred < threshold, truth)) %>% print %>% prop.table
+
+tmp %>%
+  ggplot(aes(pred, fill = truth, col = truth)) +
+  geom_density(alpha=0.3) +
+  geom_vline(xintercept = threshold, col = 4) + theme_bw()
+
+
+
+with(tmp, c(
+    alpha = mean((pred > threshold)[y[trainidx] <= 3]), 
+    power = mean((pred > threshold)[y[trainidx] > 3]))
+    )
+
+# Compute the ROC
+ROC = sapply(seq(-6,6,len=40), function(threshold) with(tmp, c(alpha = mean((pred > threshold)[y[trainidx] <= 3]), power = mean((pred > threshold)[y[trainidx] > 3]))))
+ROC
+
+plot(ROC[1,], ROC[2,], type = 'l', xlab = expression(alpha), ylab = expression(1-beta), main="ROC", xlim=0:1, ylim=0:1)
+
+ROC = ROC[, order(ROC[1,])]
+AUC = sum(ROC[2,-ncol(ROC)] * diff(ROC[1,]))
+AUC
+
+  
+```
+
+
+
